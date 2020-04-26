@@ -1,0 +1,85 @@
+
+build_path = build
+output_path = generated
+
+main_sch = board.sch
+kicad_pcb = board.kicad_pcb
+
+all_pages = True
+output_format = pdf
+
+verbose =
+video = -r
+
+dir = ./kicad-automation-scripts_new/src
+export PATH := $(dir):$(PATH)
+
+layers = $(shell $(dir)/pcbnew_print_layers --list board.kicad_pcb)
+
+all: clean run gerbers step
+
+layers:
+	$(dir)/pcbnew_print_layers --list board.kicad_pcb
+
+# ======
+
+pre:
+	@ mkdir -p $(output_path)
+
+run: pre
+	eeschema_do export -a $(main_sch) $(output_path)
+	eeschema_do export -a -f svg $(main_sch) $(output_path)
+	eeschema_do run_erc $(main_sch) $(output_path)
+	eeschema_do netlist $(main_sch) $(output_path)
+	eeschema_do bom_xml $(main_sch) $(output_path)
+	pcbnew_run_drc $(kicad_pcb) $(output_path)
+	pcbnew_print_layers $(kicad_pcb) $(output_path) "F.Cu"
+	mv $(output_path)/printed.pdf $(output_path)/board_F.Cu.pdf
+	pcbnew_print_layers $(kicad_pcb) $(output_path) "B.Cu"
+	mv $(output_path)/printed.pdf $(output_path)/board_B.Cu.pdf
+	pcbnew_print_layers $(kicad_pcb) $(output_path) $(layers)
+
+# ======
+
+dir2 = $(shell pwd)/kicad-automation-scripts_new/src/gerbers/pcbnew_automation
+dir3 = $(shell pwd)/kicad-automation-scripts_new/src/gerbers/
+export PYTHONPATH = $(dir2):$(dir3)
+
+gerbers: pre
+	python3 -m pcbnew_automation.plot $(kicad_pcb) $(output_path) $(layers)
+
+project_name = $(shell basename $(shell 	pwd))
+
+# ======
+
+step: pre
+	@ rm -rf $(output_path)/board.step
+	python3 -m pcbnew_automation.export_step $(kicad_pcb) $(output_path)
+	@ sed -i "s/KiCad electronic assembly/$(project_name) assembly generated with Kicad/g" $(output_path)/board.step
+	@ sed -i "s/An Author/KiCad/g" $(output_path)/board.step
+	@ sed -i "s/A Company/DeepX/g" $(output_path)/board.step
+	@ sed -i "s/Open CASCADE STEP translator 7.3 1/$(project_name)/g" $(output_path)/board.step
+
+#=====
+
+clean:
+	rm -rf $(output_path)
+
+# =====
+
+# Custom things to have
+#
+# - [x] ERC reports .txt
+# - [x] Schematics .pdf
+# - [x] DRC reports .txt
+# - [x] Gerbers, drills and reports (using original repo)
+# - [o] BOM, custom (grouped) format
+# - [x] Simple step model (.step)
+# - [x] Improved step model (.step) using Freecad+Stepup
+# - [ ] Visual schematic diffs from the previows git version
+# - [ ] Visual layout diff from the previows git version
+
+
+# - [ ] Board image (https://github.com/yaqwsx/PcbDraw)
+
+# python -m kicad-automation.pcbnew_automation.plot /kicad-project/<some-layout>.kicad_pcb <plot_dir> [<layers to plot>]
