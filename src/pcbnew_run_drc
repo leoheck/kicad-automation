@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Run DRC
+
+This program runs pcbnew and then runs the Distance Rules Check (DRC).
+The process is graphical and very delicated.
+Exits with the number of errors reported by pcbnew.
+"""
+
+__author__   ='Salvador E. Tropea'
+__copyright__='Copyright 2019-2020, INTI/Productize SPRL'
+__credits__  =['Salvador E. Tropea','Scott Bezek']
+__license__  ='Apache 2.0'
+__email__    ='salvador@inti.gob.ar'
+__status__   ='beta'
+
+import sys
+import os
+import logging
+import argparse
+import atexit
+import shutil
+
+# Look for the 'kicad_auto' module from where the script is running
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0,os.path.dirname(script_dir))
+# Utils import
+# Log functionality first
+from kicad_auto import log
+log.set_domain(os.path.splitext(os.path.basename(__file__))[0])
+from kicad_auto import file_util
+from kicad_auto import ui_automation
+from kicad_auto.misc import (REC_W,REC_H,__version__)
+from kicad_auto.ui_automation import (
+    PopenContext,
+    xdotool,
+    wait_for_window,
+    recorded_xvfb,
+    clipboard_store)
+
+# Return error codes
+# Negative values are DRC errors
+NO_PCB=1
+PCBNEW_CFG_PRESENT=2
+
+def parse_drc(drc_file):
+    from re import search as regex_search
+
+    with open(drc_file, 'r') as f:
+        lines = f.read().splitlines()
+
+    drc_errors = None
+    unconnected_pads = None
+
+    for line in lines:
+        if drc_errors != None and unconnected_pads != None:
+            break;
+        m = regex_search(
+            '^\*\* Found ([0-9]+) DRC errors \*\*$', line)
+        if m != None:
+            drc_errors = m.group(1);
+            continue
+        m = regex_search(
+            '^\*\* Found ([0-9]+) unconnected pads \*\*$', line)
+        if m != None:
+            unconnected_pads = m.group(1);
+            continue
+
+    return {
+        'drc_errors': int(drc_errors),
+        'unconnected_pads': int(unconnected_pads)
+    }
+
+def dismiss_already_running():
+    # The "Confirmation" modal pops up if pcbnew is already running
+    try:
+        nf_title = 'Confirmation'
+        wait_for_window(nf_title, nf_title, 1)
+
+        logger.info('Dismiss pcbnew already running')
+        xdotool(['search', '--onlyvisible', '--name', nf_title, 'windowfocus'])
+        xdotool(['key', 'Return'])
+    except RuntimeError:
+        pass
+
+def dismiss_warning():
+    try:
+        nf_title = 'Warning'
+        wait_for_window(nf_title, nf_title, 1)
+
+        logger.error('Dismiss pcbnew warning, will fail')
+        xdotool(['search', '--onlyvisible', '--name', nf_title, 'windowfocus'])
+        xdotool(['key', 'Return'])
+    except RuntimeError:
+        pass
+
+
+def run_drc(pcb_file, output_dir, record=True, save=False):
+
+    file_util.mkdir_p(output_dir)
+
+    drc_output_file = os.path.join(os.path.abspath(output_dir), args.output_name[0])
+    if os.path.exists(drc_output_file):
+        os.remove(drc_output_file)
+
+    xvfb_kwargs = { 'width': args.rec_width, 'height': args.rec_height, 'colordepth': 24, }
+
+    with recorded_xvfb(output_dir if record else None, 'pcbnew_run_drc_screencast.ogv', **xvfb_kwargs):
+        with PopenContext(['pcbnew', pcb_file], stderr=open(os.devnull, 'wb'), close_fds=True) as pcbnew_proc:
+
+            clipboard_store(drc_output_file)
+
+            failed_focuse = False
+            try:
+               wait_for_window('Main pcbnew window', 'Pcbnew', 25)
+            except RuntimeError:
+               failed_focuse = True
+               pass
+            if failed_focuse:
+               dismiss_already_running()
+               dismiss_warning()
+               wait_for_window('Main pcbnew window', 'Pcbnew', 5)
+
+            logger.info('Open Inspect->DRC')
+            xdotool(['key', 'alt+i', 'd'])
+
+            wait_for_window('DRC modal window', 'DRC Control')
+            # Note: Refill zones on DRC gets saved in ~/.config/kicad/pcbnew as RefillZonesBeforeDrc
+            # The space here is to enable the report of all errors for tracks
+            logger.info('Enable reporting all errors for tracks')
+            xdotool(['key','Tab','Tab','Tab','Tab','space','Tab','Tab','Tab','Tab'])
+            logger.info('Pasting output dir')
+            xdotool(['key', 'ctrl+v', 'Return'])
+
+            wait_for_window('Report completed dialog', 'Disk File Report Completed')
+            xdotool(['key', 'Return'])
+
+            if save:
+               xdotool(['key', 'Escape'])
+               wait_for_window('Main pcbnew window', 'Pcbnew')
+               logger.info('Saving PCB')
+               os.rename(pcb_file, pcb_file + '-bak')
+               xdotool(['key', 'ctrl+s'])
+               file_util.wait_for_file_created_by_process(pcbnew_proc.pid, os.path.realpath(pcb_file))
+
+            pcbnew_proc.terminate()
+
+    return drc_output_file
+
+# Restore the pcbnew configuration
+def restore_config():
+    if os.path.exists(old_config_file):
+       os.remove(config_file)
+       os.rename(old_config_file,config_file)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='KiCad automated DRC runner',
+                                     epilog='Runs `pcbnew` and the the DRC, the result is stored in drc_result.rpt')
+
+    parser.add_argument('kicad_pcb_file', help='KiCad PCB file')
+    parser.add_argument('output_dir', help='Output directory (for drc_result.rpt and record)')
+    parser.add_argument('--ignore_unconnected','-i',help='Ignore unconnected paths',action='store_true')
+    parser.add_argument('--output_name','-o',nargs=1,help='Name of the output file',default=['drc_result.rpt'])
+    parser.add_argument('--record','-r',help='Record the UI automation',action='store_true')
+    parser.add_argument('--rec_width',help='Record width ['+str(REC_W)+']',type=int,default=REC_W)
+    parser.add_argument('--rec_height',help='Record height ['+str(REC_H)+']',type=int,default=REC_H)
+    parser.add_argument('--save','-s',help='Save after DRC (updating filled zones)',action='store_true')
+    parser.add_argument('--verbose','-v',action='count',default=0)
+    parser.add_argument('--version','-V',action='version', version='%(prog)s '+__version__+' - '+
+                        __copyright__+' - License: '+__license__)
+
+    args = parser.parse_args()
+
+    # Create a logger with the specified verbosity
+    logger = log.init(args.verbose)
+
+    # Force english + UTF-8
+    os.environ['LANG'] = 'C.UTF-8'
+
+    if not os.path.isfile(args.kicad_pcb_file):
+       logger.error(args.kicad_pcb_file+' does not exist')
+       exit(NO_PCB)
+
+    # Back-up the current pcbnew configuration
+    kicad_cfg_dir = os.path.join(os.environ['HOME'], '.config/kicad')
+    if not os.path.isdir(kicad_cfg_dir):
+       logger.debug('Creating KiCad config dir')
+       file_util.mkdir_p(kicad_cfg_dir)
+    config_file = os.path.join(kicad_cfg_dir, 'pcbnew')
+    old_config_file = config_file + '.pre_run_drc'
+    logger.debug('PCBnew config: '+config_file)
+    # If we have an old back-up ask for the user to solve it
+    if os.path.isfile(old_config_file):
+       logger.error('PCBnew config back-up found (%s)',old_config_file)
+       logger.error('It could contain your pcbnew configuration, rename it to %s or discard it.',config_file)
+       exit(PCBNEW_CFG_PRESENT)
+    if os.path.isfile(config_file):
+       logger.debug('Moving current config to '+old_config_file)
+       os.rename(config_file,old_config_file)
+       atexit.register(restore_config)
+
+    # Create a suitable configuration
+    text_file = open(config_file,"w")
+    text_file.write('canvas_type=2\n')
+    text_file.write('RefillZonesBeforeDrc=1\n')
+    text_file.write('PcbFrameFirstRunShown=1\n')
+    text_file.write('DrcTrackToZoneTest=1\n')
+    text_file.close()
+
+    # Make sure the user has fp-lib-table
+    user_lib_table = os.path.join(kicad_cfg_dir, 'fp-lib-table')
+    if not os.path.isfile(user_lib_table):
+       logger.debug('Missing default fp-lib-table')
+       system_lib_table = '/usr/share/kicad/template/fp-lib-table'
+       if os.path.isfile(system_lib_table):
+          shutil.copy2(system_lib_table, user_lib_table)
+       else:
+          logger.warning('Missing default system footprint table '+system_lib_table+' KiCad will most probably fail')
+
+    drc_result = parse_drc(run_drc(args.kicad_pcb_file, args.output_dir, args.record, args.save))
+    logger.debug(drc_result);
+
+    if drc_result['drc_errors'] == 0 and drc_result['unconnected_pads'] == 0:
+       logger.info('No errors');
+       exit(0)
+    else:
+       logger.error('Found {} DRC errors and {} unconnected pads'.format(
+            drc_result['drc_errors'],
+            drc_result['unconnected_pads']))
+       exit(-(drc_result['drc_errors']+drc_result['unconnected_pads']))
+
